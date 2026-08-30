@@ -20,16 +20,16 @@ This mod requires **Ultimate ASI Loader** to function. You will find pre-built v
     - **Note**: If you are using other ASI mods, you might need to rename `dinput8.dll` to `version.dll` to avoid conflicts.
 2.  **Copy ASI Loader**: Place the included `dinput8.dll` (or `version.dll` if renamed) next to your game's executable (`SplitSecond.exe`).
 3.  **Download Mod**: Download the `speedometer.asi` file from the [releases page](https://github.com/theUssa1n/SplitSecond-HUD-Mod/releases) (or similar link) for your desired game version.
-4.  **Copy Mod Files**: Copy the `speedometer.asi` file and the `fonts` folder to your game's root directory (where `SplitSecond.exe` is located).
-    - **MANDATORY**: Speedometer styles will not show without the `fonts` folder.
+4.  **Copy Mod File**: Copy the `splitsecond-speedometer.asi` file to your game's root directory (where `SplitSecond.exe` is located).
+    - The fonts are embedded inside the `.asi` — no extra files are needed.
 5.  **Run the Game**: Launch `SplitSecond.exe`. The speedometer HUD should now be active in-game.
 
 ## Version Information
 
 This project supports two main versions of Split/Second:
 
-- **Retail v1 [Cracked] / SSDC Build**: This version is compatible _only_ with the cracked retail game and SSDC build.
-- **Modded Steam Builds** (Latest Elysium mod / Xenon): This version is designed for Steam versions of the game that use the Elysium Xenon mods.
+- **Retail v1 [Cracked] / SSDC Builds**: This version is compatible _only_ with the cracked retail game and SSDC builds.
+- **Modded Steam Builds** (Latest Elysium mod / Xenon): This version is designed for Steam versions of the game that use the Elysium or Xenon mods.
 
 To switch between versions, you will need to use the corresponding `speedometer.asi` file built for that specific game version. Ensure you download and install the correct `.asi` from the releases.
 
@@ -48,11 +48,10 @@ To switch between versions, you will need to use the corresponding `speedometer.
 
 If the HUD is not showing up:
 
-1.  Ensure the "fonts" folder is in your game directory.
-2.  Laptop users: Try holding `[ Fn ] + F1`, or just use the `[ K ]` key.
-3.  Check `speedometer.log` in your game folder. If the mod fails, share this log with the developer.
-4.  Disable other overlays (Steam, Discord, MSI Afterburner) if rendering issues occur.
-5.  Check if your Antivirus has quarantined `dinput8.dll/version.dll` or `speedometer.asi`.
+1.  Laptop users: Try holding `[ Fn ] + F1`, or just use the `[ K ]` key.
+2.  Check `speedometer.log` in your game folder. If the mod fails, share this log with the developer.
+3.  Disable other overlays (Steam, Discord, MSI Afterburner) if rendering issues occur.
+4.  Check if your Antivirus has quarantined `dinput8.dll/version.dll` or `speedometer.asi`.
 
 ## Source Code Prerequisites
 

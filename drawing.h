@@ -20,6 +20,10 @@ namespace Drawing {
     void SetVisible(bool visible);
     bool IsConfigOpen();
     bool IsSteamVersion();
+
+    // Called right before the D3D9 device is reset: release device-dependent
+    // resources (the cached state block) so Reset() can succeed.
+    void OnDeviceLost();
     
     // ---------------------------------------------------------
     // INPUT HANDLING

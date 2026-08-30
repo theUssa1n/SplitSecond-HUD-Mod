@@ -448,12 +448,6 @@ bool ImGui_ImplDX9_CreateDeviceObjects()
     ImGui_ImplDX9_Data* bd = ImGui_ImplDX9_GetBackendData();
     if (!bd || !bd->pd3dDevice)
         return false;
-
-    // Mark destroyed textures for recreation
-    for (ImTextureData* tex : ImGui::GetPlatformIO().Textures)
-        if (tex->Status == ImTextureStatus_Destroyed)
-            tex->SetStatus(ImTextureStatus_WantCreate);
-
     return true;
 }
 

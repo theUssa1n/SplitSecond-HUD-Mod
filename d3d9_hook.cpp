@@ -26,6 +26,7 @@ D3D9Hook::tReset D3D9Hook::oReset = nullptr;
 void* d3d9Device[119]; // Storage for VTable
 bool attached = false;
 WNDPROC oWndProc = nullptr;
+HWND g_hWnd = nullptr;   // window whose WndProc we replaced (to restore on shutdown)
 
 // ---------------------------------------------------------
 // HOOKS: SHOW RESULTS
@@ -68,11 +69,22 @@ LRESULT __stdcall WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
         return true;
 
-    // 2. Let our Drawing module handle inputs (Hotkeys)
+    // 2. While the config window is open, swallow game keyboard input so the
+    //    car doesn't react to W/A/S/D etc. while the user edits settings.
+    //    Our own hotkeys (F1/K/M) still pass through, and system key messages
+    //    (WM_SYSKEYDOWN...) are untouched so Alt+F4 keeps working.
+    if (Drawing::IsConfigOpen()) {
+        const bool isKeyboard = (msg == WM_KEYDOWN || msg == WM_KEYUP ||
+                                 msg == WM_CHAR || msg == WM_DEADCHAR);
+        if (isKeyboard && wParam != VK_F1 && wParam != 'K' && wParam != 'M')
+            return true;
+    }
+
+    // 3. Let our Drawing module handle inputs (Hotkeys)
     if (Drawing::OnWndProc(hWnd, msg, wParam, lParam))
         return true; // Input consumed by our hotkeys
 
-    // 3. Pass to original game WndProc
+    // 4. Pass to original game WndProc
     return CallWindowProc(oWndProc, hWnd, msg, wParam, lParam);
 }
 
@@ -82,6 +94,10 @@ LRESULT __stdcall WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // The Hooked Reset Function (For Alt-Tab support)
 HRESULT APIENTRY hkReset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* pPresentationParameters) {
     if (!attached) return D3D9Hook::oReset(pDevice, pPresentationParameters);
+
+    // Release our cached state block: D3D9 requires all state blocks to be
+    // released before Reset() can succeed. It is re-created on next frame.
+    Drawing::OnDeviceLost();
 
     // Lost Device: Invalidate ImGui objects
     ImGui_ImplDX9_InvalidateDeviceObjects();
@@ -113,6 +129,7 @@ HRESULT APIENTRY hkEndScene(LPDIRECT3DDEVICE9 pDevice) {
         D3DDEVICE_CREATION_PARAMETERS cp;
         pDevice->GetCreationParameters(&cp);
         oWndProc = (WNDPROC)SetWindowLongPtr(cp.hFocusWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
+        g_hWnd = cp.hFocusWindow;
         
         if (oWndProc) {
             Logger::Log("WndProc hooked successfully. Window Handle: " + std::to_string((uintptr_t)cp.hFocusWindow));
@@ -141,27 +158,37 @@ bool GetD3D9Device(void** pTable, size_t Size) {
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
     if (!pD3D) return false;
 
-    // Create a dummy window for the device
-    D3DPRESENT_PARAMETERS d3dpp = {};
-    d3dpp.Windowed = TRUE;
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    d3dpp.hDeviceWindow = GetForegroundWindow(); // Use current window
-
-    IDirect3DDevice9* pDummyDevice = nullptr;
-    HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDummyDevice);
-    
-    if (FAILED(hr) || !pDummyDevice) {
+    // Create our own hidden window: GetForegroundWindow() can return NULL at
+    // injection time (no foreground window yet), which makes CreateDevice fail
+    // and silently kills the whole mod.
+    HWND hDummyWnd = CreateWindowExA(0, "STATIC", "D3D9Hook", WS_POPUP,
+                                     0, 0, 100, 100, NULL, NULL,
+                                     GetModuleHandleA(nullptr), nullptr);
+    if (!hDummyWnd) {
         pD3D->Release();
         return false;
     }
 
-    // Copy the VTable
-    memcpy(pTable, *reinterpret_cast<void***>(pDummyDevice), Size);
+    D3DPRESENT_PARAMETERS d3dpp = {};
+    d3dpp.Windowed = TRUE;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.hDeviceWindow = hDummyWnd;
 
-    // Cleanup
-    pDummyDevice->Release();
+    IDirect3DDevice9* pDummyDevice = nullptr;
+    HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hDummyWnd,
+                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDummyDevice);
+
+    bool ok = false;
+    if (SUCCEEDED(hr) && pDummyDevice) {
+        // Copy the VTable
+        memcpy(pTable, *reinterpret_cast<void***>(pDummyDevice), Size);
+        pDummyDevice->Release();
+        ok = true;
+    }
+
+    DestroyWindow(hDummyWnd);
     pD3D->Release();
-    return true;
+    return ok;
 }
 
 // ---------------------------------------------------------
@@ -215,7 +242,9 @@ void D3D9Hook::Initialize(HMODULE hModule) {
         Logger::Log("All hooks enabled");
 
         // 7. Resolve and Create Hook for ShowResults (Auto-Hide) safely
-        SHOW_RESULTS_ADDR = Drawing::IsSteamVersion() ? (void*)0x00B6B8C0 : (void*)0x00B6B990;
+        // Steam: verified 0xB6B8E0 (the debug-HUD-setup function, not 0xB6B8C0
+        // which is a math function right before it).
+        SHOW_RESULTS_ADDR = Drawing::IsSteamVersion() ? (void*)0x00B6B8E0 : (void*)0x00B6B990;
         Logger::Log("Target ShowResults address: " + std::to_string((uintptr_t)SHOW_RESULTS_ADDR));
         
         if (SHOW_RESULTS_ADDR) {
@@ -240,6 +269,15 @@ void D3D9Hook::Initialize(HMODULE hModule) {
 // ---------------------------------------------------------
 void D3D9Hook::Shutdown() {
     attached = false;
+
+    // Restore the original WndProc if ours is still installed
+    if (oWndProc && g_hWnd) {
+        if ((WNDPROC)GetWindowLongPtr(g_hWnd, GWLP_WNDPROC) == WndProc)
+            SetWindowLongPtr(g_hWnd, GWLP_WNDPROC, (LONG_PTR)oWndProc);
+        oWndProc = nullptr;
+        g_hWnd = nullptr;
+    }
+
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
 }

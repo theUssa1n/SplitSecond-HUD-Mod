@@ -1,4 +1,5 @@
 #include "drawing.h"
+#include "imgui/imgui_internal.h"
 #include "embedded_fonts.h"
 #include "logger.h"
 #include <string>
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <cfloat>
 #include <algorithm>
 #include <fstream>
 
@@ -72,15 +74,13 @@ namespace {
         return "speedometer.ini";
     }
 
-    std::string GetFontPath(const std::string& fontName) {
-        char path[MAX_PATH];
-        if (GetModuleFileNameA(NULL, path, MAX_PATH)) {
-            std::string p(path);
-            size_t pos = p.find_last_of("\\/");
-            return p.substr(0, pos) + "\\fonts\\" + fontName;
-        }
-        return "fonts\\" + fontName;
-    }
+    // Cached game state — updated once per frame in Render(), read by
+    // OnWndProc() so we never call into game code from the message pump.
+    bool g_inRace = false;
+    bool g_isPaused = false;
+
+    // Cached D3D9 state block (created once, released on device reset).
+    IDirect3DStateBlock9* g_stateBlock = nullptr;
 }
 
 // ---------------------------------------------------------
@@ -88,7 +88,7 @@ namespace {
 // ---------------------------------------------------------
 // --- VERSION SELECTION ---
 // Uncomment the line below to build for STEAM version. Keep commented for RETAIL/CRACKED.
-//#define USE_STEAM_VERSION
+#define USE_STEAM_VERSION
 
 #ifdef USE_STEAM_VERSION
     // STEAM[xenon] Version Addresses
@@ -231,40 +231,29 @@ void ResetConfig() {
 bool CallIsGamePaused(uintptr_t funcAddr, uintptr_t thisPtr);
 
 bool Drawing::OnWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Only process inputs if we are in-game
-    bool isPaused = false;
-    std::uint32_t in_game_ui = 0;
-    
-    // Check game state first
-    if (IN_GAME_UI_PTR != 0 && !IsBadReadPtr((void*)IN_GAME_UI_PTR, sizeof(std::uint32_t))) {
-        in_game_ui = *reinterpret_cast<std::uint32_t*>(IN_GAME_UI_PTR);
-        if (in_game_ui != 0) {
-            isPaused = CallIsGamePaused(IS_PAUSED_FUNC_ADDR, in_game_ui);
-        }
+    // Hotkeys only — game state comes from the per-frame cache in Render(),
+    // so nothing expensive (game calls, IsBadReadPtr, logging) happens here
+    // for every single window message.
+    if (msg != WM_KEYDOWN)
+        return false;
+
+    // Allow hotkeys only if in-game and not paused
+    if (!g_inRace || g_isPaused)
+        return false;
+
+    if (wParam == 'K') {
+        config.isVisible = !config.isVisible;
+        return true; // Consume input
+    }
+    if (wParam == 'M') {
+        config.useMetric = !config.useMetric;
+        return true; // Consume input
+    }
+    if (wParam == VK_F1) {
+        config.showConfigWindow = !config.showConfigWindow;
+        return true; // Consume input
     }
 
-    // Allow inputs only if in-game and not paused
-    if (in_game_ui != 0 && !isPaused) {
-        if (msg == WM_KEYDOWN) {
-            Logger::Log("Key pressed: " + std::to_string(wParam));
-            if (wParam == 'K') {
-                config.isVisible = !config.isVisible;
-                return true; // Consume input
-            }
-            if (wParam == 'M') {
-                config.useMetric = !config.useMetric;
-                return true; // Consume input
-            }
-            if (wParam == VK_F1) {
-                config.showConfigWindow = !config.showConfigWindow;
-                return true; // Consume input
-            }
-        }
-    } else {
-        // Force close config if not in race
-        if (config.showConfigWindow) config.showConfigWindow = false;
-    }
-    
     return false; // Don't consume other inputs
 }
 
@@ -372,9 +361,17 @@ void Drawing::Init(LPDIRECT3DDEVICE9 pDevice) {
 void DrawConfigWindow() {
     if (!config.showConfigWindow) return;
 
-    // Use standard size, no manual scaling needed as DisplaySize matches Window Size
+    // Sizes are in logical (window client) pixels — the standard ImGui space.
     ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
+
+    // Panel font: default 13px — glyphs are baked at the framebuffer density
+    // (see SetFontRasterizerDensity in Render), so text stays crisp at any
+    // internal resolution the game renders at.
+    const bool fontPushed = (font_default != nullptr);
+    if (fontPushed)
+        ImGui::PushFont(font_default, 13.0f);
+
     if (ImGui::Begin("Speedometer Configuration", &config.showConfigWindow)) {
         
         ImGui::Text("Global Settings");
@@ -444,6 +441,8 @@ void DrawConfigWindow() {
         }
     }
     ImGui::End();
+    if (fontPushed)
+        ImGui::PopFont();
 }
 
 // Helper for safe __thiscall (Implementation moved to top)
@@ -459,84 +458,92 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
         firstRender = false;
     }
 
-    // Save State Block to prevent graphical glitches
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    if (SUCCEEDED(pDevice->CreateStateBlock(D3DSBT_ALL, &stateBlock)) && stateBlock) {
-        if (FAILED(stateBlock->Capture())) {
-            stateBlock->Release();
-            stateBlock = nullptr;
-        }
+    // Save State Block to prevent graphical glitches.
+    // Created once and reused every frame (creating/releasing per frame is
+    // expensive); released in OnDeviceLost() before a device reset.
+    if (!g_stateBlock) {
+        if (FAILED(pDevice->CreateStateBlock(D3DSBT_ALL, &g_stateBlock)))
+            g_stateBlock = nullptr;
     }
+    if (g_stateBlock)
+        g_stateBlock->Capture();
 
+    // Backend NewFrame: the Win32 backend sets io.DisplaySize to the window
+    // CLIENT size every frame — that IS our logical coordinate space (and the
+    // same space mouse messages use, so hit-testing is exact by construction).
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
 
     // --- RESOLUTION SETUP ---
     ImGuiIO& io = ImGui::GetIO();
-    
-    // 1. Get Actual Window Size (Client Area from Windows)
-    float windowW = 0.0f, windowH = 0.0f;
-    D3DDEVICE_CREATION_PARAMETERS cp;
-    if (SUCCEEDED(pDevice->GetCreationParameters(&cp)) && cp.hFocusWindow) {
-        RECT rect;
-        if (GetClientRect(cp.hFocusWindow, &rect)) {
-            windowW = (float)(rect.right - rect.left);
-            windowH = (float)(rect.bottom - rect.top);
-        }
-    }
 
-    // 2. Get BackBuffer Size (Internal Game Resolution)
-    float backbufferW = windowW;
-    float backbufferH = windowH;
-    
+    // The game may render into a surface LARGER than the window (DSR /
+    // internal supersampling). Tell ImGui the framebuffer scale: the DX9
+    // backend scales all geometry by it (1:1 surface pixels) and the 1.92
+    // font system bakes glyphs at that density, so text stays crisp.
+    // DisplaySize itself is left alone — it belongs to the backend.
+    float surfaceW = 0.0f, surfaceH = 0.0f;
+
     IDirect3DSurface9* rt = nullptr;
     if (SUCCEEDED(pDevice->GetRenderTarget(0, &rt)) && rt) {
         D3DSURFACE_DESC desc;
         if (SUCCEEDED(rt->GetDesc(&desc))) {
-            backbufferW = (float)desc.Width;
-            backbufferH = (float)desc.Height;
+            surfaceW = (float)desc.Width;
+            surfaceH = (float)desc.Height;
         }
         rt->Release();
     }
-    
-    // Fallback: If Backbuffer read failed, use Viewport
-    if (backbufferW <= 0) {
+
+    if (surfaceW <= 0) {
+        IDirect3DSurface9* bb = nullptr;
+        if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+            D3DSURFACE_DESC desc;
+            if (SUCCEEDED(bb->GetDesc(&desc))) {
+                surfaceW = (float)desc.Width;
+                surfaceH = (float)desc.Height;
+            }
+            bb->Release();
+        }
+    }
+
+    if (surfaceW <= 0) {
         D3DVIEWPORT9 vp;
         pDevice->GetViewport(&vp);
-        backbufferW = (float)vp.Width;
-        backbufferH = (float)vp.Height;
+        surfaceW = (float)vp.Width;
+        surfaceH = (float)vp.Height;
     }
 
-    // Fallback: If Window size failed, assume it matches Backbuffer (Windowed Fullscreen)
-    if (windowW <= 0) {
-        windowW = backbufferW;
-        windowH = backbufferH;
+    float fbScaleX = 1.0f, fbScaleY = 1.0f;
+    if (io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f && surfaceW > 0.0f && surfaceH > 0.0f) {
+        fbScaleX = surfaceW / io.DisplaySize.x;
+        fbScaleY = surfaceH / io.DisplaySize.y;
+        if (fbScaleX < 0.25f) fbScaleX = 0.25f;
+        if (fbScaleX > 4.0f)  fbScaleX = 4.0f;
+        if (fbScaleY < 0.25f) fbScaleY = 0.25f;
+        if (fbScaleY > 4.0f)  fbScaleY = 4.0f;
+    }
+    io.DisplayFramebufferScale = ImVec2(fbScaleX, fbScaleY);
+
+    static float lastFbScaleX = 0.0f;
+    if (fbScaleX != lastFbScaleX) {
+        Logger::Log("Surface " + std::to_string((int)surfaceW) + "x" + std::to_string((int)surfaceH) +
+                    ", client " + std::to_string((int)io.DisplaySize.x) + "x" + std::to_string((int)io.DisplaySize.y) +
+                    ", framebuffer scale " + std::to_string(fbScaleX));
+        lastFbScaleX = fbScaleX;
     }
 
-    // 3. Setup ImGui Resolution
-    // Use Window Size for Logical Layout and FramebufferScale for Rendering
-    io.DisplaySize = ImVec2(windowW, windowH);
-    
-    if (windowW > 0 && windowH > 0) {
-        io.DisplayFramebufferScale = ImVec2(backbufferW / windowW, backbufferH / windowH);
-    } else {
-        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-    }
-
-    // Style Scaling
-    ImGuiStyle& style = ImGui::GetStyle();
-    // Reset FontGlobalScale to 1.0f (Standard)
-    io.FontGlobalScale = 1.0f; 
-    
-    // Reset Style Scaling to 1.0f (Standard)
-    style.ScaleAllSizes(1.0f);
-    
-    // Ensure FontGlobalScale is 1.0f
-    io.FontGlobalScale = 1.0f; 
+    // Style: keep defaults — no per-frame scaling noise needed.
+    io.FontGlobalScale = 1.0f;
 
     // ---------------------------------------------------------
 
     ImGui::NewFrame();
+
+    // Bake glyphs at the framebuffer density. Begin() would set this from
+    // DisplayFramebufferScale automatically, but our HUD text is drawn on the
+    // background draw list possibly BEFORE any window — set it explicitly so
+    // those glyphs are baked dense (crisp) too.
+    ImGui::SetFontRasterizerDensity(fbScaleX);
 
     // 1. Read Game Data
     float currentSpeed = 0.0f;
@@ -546,44 +553,94 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
     static bool speedAddrFound = false;
     static bool uiAddrFound = false;
 
-    try {
-        if (SPEED_ADDRESS != 0) {
-            // Basic pointer check before read
-            if (!IsBadReadPtr((void*)SPEED_ADDRESS, sizeof(float))) {
-                currentSpeed = *(float*)SPEED_ADDRESS;
-                if (!speedAddrFound) {
-                    Logger::Log("Speed address is readable: " + std::to_string(currentSpeed));
-                    speedAddrFound = true;
-                }
+    if (SPEED_ADDRESS != 0) {
+        // Basic pointer check before read
+        if (!IsBadReadPtr((void*)SPEED_ADDRESS, sizeof(float))) {
+            currentSpeed = *(float*)SPEED_ADDRESS;
+            if (!speedAddrFound) {
+                Logger::Log("Speed address is readable: " + std::to_string(currentSpeed));
+                speedAddrFound = true;
             }
         }
-        
-        if (IN_GAME_UI_PTR != 0) {
-            if (!IsBadReadPtr((void*)IN_GAME_UI_PTR, sizeof(std::uint32_t))) {
-                in_game_ui = *reinterpret_cast<std::uint32_t*>(IN_GAME_UI_PTR);
-                if (!uiAddrFound && in_game_ui != 0) {
-                    Logger::Log("In-Game UI pointer resolved: " + std::to_string(in_game_ui));
-                    uiAddrFound = true;
-                }
+    }
+
+    if (IN_GAME_UI_PTR != 0) {
+        if (!IsBadReadPtr((void*)IN_GAME_UI_PTR, sizeof(std::uint32_t))) {
+            in_game_ui = *reinterpret_cast<std::uint32_t*>(IN_GAME_UI_PTR);
+            if (!uiAddrFound && in_game_ui != 0) {
+                Logger::Log("In-Game UI pointer resolved: " + std::to_string(in_game_ui));
+                uiAddrFound = true;
             }
         }
-        
-        if (in_game_ui != 0) {
-            // Safe call wrapper
-            isPaused = CallIsGamePaused(IS_PAUSED_FUNC_ADDR, in_game_ui);
-        }
-    } catch (...) {}
+    }
+
+    if (in_game_ui != 0) {
+        // Safe call wrapper
+        isPaused = CallIsGamePaused(IS_PAUSED_FUNC_ADDR, in_game_ui);
+    }
+
+    // Read the InGameUI view state ([InGameUI+8]). This is the signal that
+    // tells us whether the 3D HUD (lap/rank/powerplay) is actually up:
+    //   0 = racing, HUD up
+    //   1 = modal state (not racing-critical; keep HUD for now)
+    //   2,3 = paused
+    //   4 = race results (HUD hidden)
+    //   5 = loading / mode-map info screen (HUD hidden)
+    int viewState = -1;
+    if (in_game_ui != 0 && !IsBadReadPtr((void*)(in_game_ui + 8), sizeof(int)))
+        viewState = *(int*)(in_game_ui + 8);
+
+    // Hide for every known non-racing view state (pause/results/loading).
+    // Debounce: on transitions (entering loading, leaving results) the state
+    // can briefly report "Racing" (0) — on the Steam build this lasts up to
+    // ~1s at the very start of a loading screen before it flips to Loading
+    // (5). If that transient 0 was trusted the HUD would blink once per
+    // loading screen (retail either has no such transient or it is shorter).
+    // Fix: keep a "pre-race" flag that holds the HUD (longer grace) until the
+    // race's Loading state (5) has been confirmed or the 0 state proved
+    // stable, then fall back to the normal short grace. DeltaTime is clamped
+    // (0.1s) so a single hitched frame can't jump the timer past the grace.
+    static float hudShowTimer = 0.0f;
+    static bool s_preRace = true;   // waiting for the race's Loading (5) state
+    bool hudUp = false;
+    const bool isHideView = (viewState == 2 || viewState == 3 || viewState == 4 || viewState == 5);
+    if (in_game_ui == 0) {
+        s_preRace = true;           // fresh entry (menu): don't trust the next 0 yet
+        hudShowTimer = 0.0f;
+        hudUp = false;
+    } else if (isHideView) {
+        if (viewState == 5)
+            s_preRace = false;      // Loading confirmed -> next 0 is the real race
+        else if (viewState == 4)
+            s_preRace = true;       // results -> a rematch may re-enter via a 0 transient
+        hudShowTimer = 0.0f;
+        hudUp = false;
+    } else {
+        const float dt = (io.DeltaTime > 0.1f) ? 0.1f : io.DeltaTime;
+        const float grace = s_preRace ? 3.0f : 0.75f;
+        hudShowTimer += dt;
+        hudUp = (hudShowTimer >= grace);
+        if (hudUp)
+            s_preRace = false;      // 0 proved stable -> treat as a real race
+    }
+
+    // Cache the game state for the WndProc hotkey handler (one update per
+    // frame — OnWndProc() never calls into the game itself).
+    g_inRace = (in_game_ui != 0) && hudUp;
+    g_isPaused = isPaused;
 
     // 2. Handle Inputs
     // Input handling is now done in OnWndProc to avoid Alt-Tab issues.
     
     // Safety: Force close config window if not in race or paused
-    if (in_game_ui == 0 || isPaused) {
+    if (in_game_ui == 0 || isPaused || !hudUp) {
         config.showConfigWindow = false;
     }
 
     // Auto-Show Logic (Race Start)
-    bool currentlyInRace = (in_game_ui != 0);
+    // "In race" now means: InGameUI exists AND the 3D HUD view is up
+    // (so loading screens, results and pause don't count as racing).
+    bool currentlyInRace = (in_game_ui != 0) && hudUp;
     if (currentlyInRace && !wasInRace) {
         config.isVisible = true;
     }
@@ -591,15 +648,26 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
 
     // 3. Render
     // Separate HUD visibility from Config Window visibility
-    bool shouldDrawHUD = config.isVisible && in_game_ui != 0 && !isPaused;
+    bool shouldDrawHUD = config.isVisible && currentlyInRace && !isPaused;
     bool shouldDrawConfig = config.showConfigWindow;
 
-    // Mouse Cursor Logic
+    // Mouse cursor: use the OS hardware cursor while the config window is
+    // open (like GM does). A software cursor (io.MouseDrawCursor) is only
+    // redrawn once per rendered frame, so with the game's refresh rate it
+    // feels laggy — the hardware cursor moves at the mouse's own polling
+    // rate, independent of the game's framerate.
+    // Re-show every frame (in case the game hides the cursor again) and undo
+    // exactly the number of ShowCursor(TRUE) calls we made when it closes.
+    static int s_cursorShown = 0;
     if (shouldDrawConfig) {
-        io.MouseDrawCursor = true;
-    } else {
-        io.MouseDrawCursor = false;
+        ShowCursor(TRUE);
+        s_cursorShown++;
+    } else if (s_cursorShown > 0) {
+        for (int i = 0; i < s_cursorShown; i++)
+            ShowCursor(FALSE);
+        s_cursorShown = 0;
     }
+    io.MouseDrawCursor = false;
 
     // Always attempt to draw config window if enabled
     // Moved to the end of Render to ensure it's drawn ON TOP of the HUD
@@ -619,200 +687,169 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
         // HUD Rendering
         float scaleFactor = (io.DisplaySize.y / 1080.0f) * config.globalScale;
         if (scaleFactor < 0.1f) scaleFactor = 0.1f;
-        
+
         // Safety check for invalid positions (NaN or Infinity)
         if (std::isnan(config.globalPosX)) config.globalPosX = 40.0f;
         if (std::isnan(config.globalPosY)) config.globalPosY = 40.0f;
 
-        ImGui::SetNextWindowPos(
-            ImVec2(io.DisplaySize.x - config.globalPosX * scaleFactor, io.DisplaySize.y - config.globalPosY * scaleFactor),
-            ImGuiCond_Always,
-            ImVec2(1.0f, 1.0f)
-        );
+        // Anchor: bottom-right corner of the HUD area
+        ImVec2 anchor(io.DisplaySize.x - config.globalPosX * scaleFactor,
+                      io.DisplaySize.y - config.globalPosY * scaleFactor);
 
-        ImGui::SetNextWindowBgAlpha(0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        // Select Font based on config
+        ImFont* currentFont = font_default;
+        if (config.fontStyle == 1 && font_dash) currentFont = font_dash;
+        if (config.fontStyle == 2 && font_sprint) currentFont = font_sprint;
 
-        if (ImGui::Begin("HUD", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground)) {
-            ImDrawList* draw_list = ImGui::GetWindowDrawList();
-            ImVec2 p = ImGui::GetCursorScreenPos();
+        // Explicit pixel font sizes (13px base * legacy 5x / 2x factors).
+        // Logical pixels — passed straight to AddText(): the 1.92 font system
+        // bakes glyphs at size * framebuffer density, so text stays crisp at
+        // any internal resolution. (The old SetWindowFontScale path multiplied
+        // the window scale instead.)
+        float speedFontPx = 65.0f * config.globalScale * config.speedScale;
+        float unitFontPx  = 26.0f * config.globalScale * config.unitScale;
 
-            // Reserve space to prevent clipping (Important for AlwaysAutoResize)
-            // Estimate max size based on configuration
-            float estimatedWidth = 400.0f * scaleFactor;
-            float estimatedHeight = 200.0f * scaleFactor;
-            
-            // Adjust based on config values to be safe
-            if (config.barWidth * scaleFactor > estimatedWidth) estimatedWidth = config.barWidth * scaleFactor + 50.0f;
-            
-            // Use Dummy to force window size
-            ImGui::Dummy(ImVec2(estimatedWidth, estimatedHeight));
+        // Prepare strings and measure them at their real sizes
+        char speedText[32];
+        sprintf_s(speedText, sizeof(speedText), "%d", (int)lroundf(displaySpeed));
 
-            // Select Font based on config
-            ImFont* currentFont = font_default;
-            if (config.fontStyle == 1 && font_dash) currentFont = font_dash;
-            if (config.fontStyle == 2 && font_sprint) currentFont = font_sprint;
+        ImVec2 speedSize(0, 0);
+        if (config.showSpeed)
+            speedSize = currentFont->CalcTextSizeA(speedFontPx, FLT_MAX, 0.0f, speedText);
 
-            ImGui::PushFont(currentFont);
+        ImVec2 unitSize(0, 0);
+        if (config.showUnit)
+            unitSize = currentFont->CalcTextSizeA(unitFontPx, FLT_MAX, 0.0f, unitStr.c_str());
 
-            // Prepare strings and sizes for layout calculation
-            char speedText[32];
-            sprintf_s(speedText, sizeof(speedText), "%d", (int)displaySpeed);
-            
-            ImVec2 speedSize(0,0);
-            if (config.showSpeed) {
-                float fontScale = 5.0f * config.globalScale * config.speedScale;
-                ImGui::SetWindowFontScale(fontScale);
-                speedSize = ImGui::CalcTextSize(speedText);
-            }
+        // Draw on the background draw list: no window, no Dummy(), no
+        // estimated-size clipping — the HUD can never be cut off anymore,
+        // and the config window still renders on top of it.
+        ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
 
-            ImVec2 unitSize(0,0);
+        // Calculate Positions
+        ImVec2 speedPos(0, 0);
+        ImVec2 unitPos(0, 0);
+        ImVec2 barStart(0, 0);
+
+        // Bar dimensions
+        float bWidth = config.barWidth * scaleFactor;
+        float bHeight = config.barHeight * scaleFactor;
+        float bSkew = config.barSkew * scaleFactor;
+
+        // Stable reference for the whole HUD block: a 400x200 (scaled) box
+        // whose bottom-right corner sits on the anchor.
+        float refX = anchor.x - 400.0f * scaleFactor;
+        float refY = anchor.y - 200.0f * scaleFactor;
+
+        if (config.smartLayout) {
+            // Stable visual center of the HUD block (200 scaled px left of
+            // the anchor). Everything below is anchored to fixed points, so
+            // the layout never depends on the current text size.
+            float visualCenterX = refX + 200.0f * scaleFactor;
+
+            // Right-align the text block at a FIXED right edge: the unit
+            // never moves and the number grows leftward as digits are added.
+            // This removes the horizontal jitter the old centered layout had
+            // whenever the digit count changed (99 -> 100 -> ...).
+            float rightEdge = visualCenterX + 100.0f * scaleFactor;
+            float gap = config.smartGap * scaleFactor;
+            float currentX = rightEdge;
             if (config.showUnit) {
-                float fontScale = 2.0f * config.globalScale * config.unitScale;
-                ImGui::SetWindowFontScale(fontScale);
-                unitSize = ImGui::CalcTextSize(unitStr.c_str());
+                unitPos.x = currentX - unitSize.x;
+                currentX = unitPos.x - gap;
             }
+            if (config.showSpeed)
+                speedPos.x = currentX - speedSize.x;
 
-            // Calculate Positions
-            ImVec2 speedPos;
-            ImVec2 unitPos;
-            ImVec2 barStart;
+            // Y: absolute offsets relative to the reference top
+            speedPos.y = refY + config.speedOffsetY * scaleFactor;
+            unitPos.y  = refY + config.unitOffsetY * scaleFactor;
 
-            // Bar dimensions
-            float bWidth = config.barWidth * scaleFactor;
-            float bHeight = config.barHeight * scaleFactor;
-            float bSkew = config.barSkew * scaleFactor;
-            
-            // Bar position (Default/Legacy)
-            barStart = ImVec2(p.x + config.barOffsetX * scaleFactor, p.y + config.barOffsetY * scaleFactor);
-            
-            if (config.smartLayout) {
-                // Smart Layout Logic:
-                // 1. Establish a stable visual center relative to the Window's Right Edge.
-                //    (Because the window is anchored Bottom-Right, 'p' moves left when window expands.
-                //     We want the text to stay put even if the bar grows/moves.)
-                float fixedCenterOffset = 200.0f * scaleFactor; // Half of base width (400)
-                float visualCenterX = p.x + estimatedWidth - fixedCenterOffset;
+            // Bar centered on visualCenterX + barOffsetX (decoupled from text)
+            float effectiveBarCenterOffset = (bWidth / 2.0f) - (bSkew / 2.0f);
+            float barCenterX = visualCenterX + config.barOffsetX * scaleFactor;
+            barStart.x = barCenterX - effectiveBarCenterOffset;
 
-                // 2. Calculate Total Text Width
-                float gap = config.smartGap * scaleFactor;
-                float totalTextWidth = 0.0f;
-                if (config.showSpeed) totalTextWidth += speedSize.x;
-                if (config.showSpeed && config.showUnit) totalTextWidth += gap;
-                if (config.showUnit) totalTextWidth += unitSize.x;
-                
-                // 3. Center Text Block around visualCenterX
-                float currentX = visualCenterX - (totalTextWidth / 2.0f);
-                
-                // Set Speed Pos
-                if (config.showSpeed) {
-                    speedPos = ImVec2(currentX, p.y + config.speedOffsetY * scaleFactor);
-                    currentX += speedSize.x + gap;
-                }
-                
-                // Set Unit Pos
-                if (config.showUnit) {
-                    // Decoupled from Speed Y (Absolute Y offset relative to anchor)
-                    unitPos = ImVec2(currentX, p.y + config.unitOffsetY * scaleFactor);
-                }
-                
-                // 4. Center Bar around visualCenterX + barOffsetX
-                //    This decouples Bar movement from Text movement.
-                //    Adjust for Skew to center visually (Center of Mass)
-                float bSkew = config.barSkew * scaleFactor;
-                float effectiveBarCenterOffset = (bWidth / 2.0f) - (bSkew / 2.0f);
-                float barCenterX = visualCenterX + config.barOffsetX * scaleFactor;
-                
-                barStart.x = barCenterX - effectiveBarCenterOffset;
+            // Bar Y: below the tallest text, independent of text offsets
+            float maxTextHeight = 0.0f;
+            if (config.showSpeed) maxTextHeight = (std::max)(maxTextHeight, speedSize.y);
+            if (config.showUnit)  maxTextHeight = (std::max)(maxTextHeight, unitSize.y);
+            float barPadding = 5.0f * scaleFactor;
+            barStart.y = refY + maxTextHeight + config.barOffsetY * scaleFactor + barPadding;
+        } else {
+            // Legacy / Manual Layout — offsets relative to the fixed reference
+            // box. (The old version measured them from a window whose size
+            // depended on the estimated content, which made these offsets
+            // shift around when the bar width changed.)
+            speedPos = ImVec2(refX + config.speedOffsetX * scaleFactor,
+                              refY + config.speedOffsetY * scaleFactor);
+            unitPos  = ImVec2(refX + config.unitOffsetX * scaleFactor,
+                              refY + config.unitOffsetY * scaleFactor);
 
-                // 5. Adjust Bar Y (Independent of Text Position)
-                //    We base it on the Text Height (so it defaults to below text), 
-                //    but NOT on the Text Offset (so moving text doesn't move bar).
-                float maxTextHeight = 0.0f;
-                if (config.showSpeed) maxTextHeight = (std::max)(maxTextHeight, speedSize.y);
-                if (config.showUnit) maxTextHeight = (std::max)(maxTextHeight, unitSize.y);
-                
-                // Add padding to prevent text from overlapping bar (e.g. 5px scaled)
-                float barPadding = 5.0f * scaleFactor; 
-                barStart.y = p.y + maxTextHeight + config.barOffsetY * scaleFactor + barPadding;
-            } else {
-                // Legacy / Manual Layout
-                speedPos = ImVec2(p.x + config.speedOffsetX * scaleFactor, p.y + config.speedOffsetY * scaleFactor);
-                unitPos = ImVec2(p.x + config.unitOffsetX * scaleFactor, p.y + config.unitOffsetY * scaleFactor);
-                
-                float currentTextBottom = p.y;
-                if (config.showSpeed) currentTextBottom += speedSize.y;
-                
-                // Add padding here too
-                float barPadding = 5.0f * scaleFactor;
-                barStart.y = currentTextBottom + config.barOffsetY * scaleFactor + barPadding;
-            }
+            float currentTextBottom = refY;
+            if (config.showSpeed) currentTextBottom += speedSize.y;
 
-            // 1. Draw Gauge Bar (Draw FIRST so text is on top)
-            if (config.showBar) {
-                float gaugeSpeed = (displaySpeed > maxSpeedGauge) ? maxSpeedGauge : ((displaySpeed < 0.0f) ? 0.0f : displaySpeed);
-                float speedFraction = gaugeSpeed / maxSpeedGauge;
-
-                ImVec2 barEnd = ImVec2(barStart.x + bWidth, barStart.y + bHeight);
-
-                // Background
-                ImVec2 p1 = barStart;
-                ImVec2 p2 = ImVec2(barEnd.x, barStart.y);
-                ImVec2 p3 = ImVec2(barEnd.x - bSkew, barEnd.y);
-                ImVec2 p4 = ImVec2(barStart.x - bSkew, barEnd.y);
-                
-                draw_list->AddQuadFilled(p1, p2, p3, p4, IM_COL32(40, 40, 40, 200));
-
-                // Active
-                if (speedFraction > 0.0f) {
-                    float fillWidth = bWidth * speedFraction;
-                    ImVec2 f2 = ImVec2(barStart.x + fillWidth, barStart.y);
-                    ImVec2 f3 = ImVec2(barStart.x + fillWidth - bSkew, barEnd.y);
-                    ImU32 barColor = GetSpeedColor(speedFraction);
-                    draw_list->AddQuadFilled(p1, f2, f3, p4, barColor);
-                }
-            }
-
-            // 2. Draw Speed Text
-            if (config.showSpeed) {
-                float fontScale = 5.0f * config.globalScale * config.speedScale;
-                ImGui::SetWindowFontScale(fontScale);
-                
-                // Align Bottom with Unit if Smart Layout is ON (or just always align baselines?)
-                // Let's align bottoms of Speed and Unit based on their height
-                float maxH = speedSize.y;
-                if (config.showUnit && unitSize.y > maxH) maxH = unitSize.y;
-                
-                // Apply Offset for Bottom Alignment
-                float yOffset = maxH - speedSize.y;
-                ImVec2 finalPos = ImVec2(speedPos.x, speedPos.y + yOffset);
-
-                // Shadow
-                draw_list->AddText(ImVec2(finalPos.x + 2, finalPos.y + 2), IM_COL32(0,0,0,200), speedText);
-                // Main Text
-                draw_list->AddText(finalPos, IM_COL32(255,255,255,255), speedText);
-            }
-
-            // 3. Draw Speed Unit
-            if (config.showUnit) {
-                float fontScale = 2.0f * config.globalScale * config.unitScale;
-                ImGui::SetWindowFontScale(fontScale);
-                
-                // Align Bottom
-                float maxH = unitSize.y;
-                if (config.showSpeed && speedSize.y > maxH) maxH = speedSize.y;
-                
-                float yOffset = maxH - unitSize.y;
-                ImVec2 finalPos = ImVec2(unitPos.x, unitPos.y + yOffset);
-
-                draw_list->AddText(finalPos, IM_COL32(180,180,180,255), unitStr.c_str());
-            }
-
-            ImGui::PopFont(); // Restore default font for other windows (like Config)
-            ImGui::End();
+            float barPadding = 5.0f * scaleFactor;
+            barStart = ImVec2(refX + config.barOffsetX * scaleFactor,
+                              currentTextBottom + config.barOffsetY * scaleFactor + barPadding);
         }
-        ImGui::PopStyleVar(2);
+
+        // 1. Draw Gauge Bar (Draw FIRST so text is on top)
+        if (config.showBar) {
+            float gaugeSpeed = (displaySpeed > maxSpeedGauge) ? maxSpeedGauge : ((displaySpeed < 0.0f) ? 0.0f : displaySpeed);
+            float speedFraction = gaugeSpeed / maxSpeedGauge;
+
+            ImVec2 barEnd = ImVec2(barStart.x + bWidth, barStart.y + bHeight);
+
+            // Background
+            ImVec2 p1 = barStart;
+            ImVec2 p2 = ImVec2(barEnd.x, barStart.y);
+            ImVec2 p3 = ImVec2(barEnd.x - bSkew, barEnd.y);
+            ImVec2 p4 = ImVec2(barStart.x - bSkew, barEnd.y);
+
+            draw_list->AddQuadFilled(p1, p2, p3, p4, IM_COL32(40, 40, 40, 200));
+
+            // Active
+            if (speedFraction > 0.0f) {
+                float fillWidth = bWidth * speedFraction;
+                ImVec2 f2 = ImVec2(barStart.x + fillWidth, barStart.y);
+                ImVec2 f3 = ImVec2(barStart.x + fillWidth - bSkew, barEnd.y);
+                ImU32 barColor = GetSpeedColor(speedFraction);
+                draw_list->AddQuadFilled(p1, f2, f3, p4, barColor);
+            }
+        }
+
+        // 2. Draw Speed Text (bottom-aligned with the unit)
+        if (config.showSpeed) {
+            float maxH = speedSize.y;
+            if (config.showUnit && unitSize.y > maxH) maxH = unitSize.y;
+
+            float yOffset = maxH - speedSize.y;
+            ImVec2 finalPos = ImVec2(speedPos.x, speedPos.y + yOffset);
+
+            // Shadow offset scales with the font so it stays visible at 65px+
+            float shadowOff = (std::max)(2.0f, speedFontPx * 0.03f);
+
+            // Shadow
+            draw_list->AddText(currentFont, speedFontPx,
+                               ImVec2(finalPos.x + shadowOff, finalPos.y + shadowOff),
+                               IM_COL32(0, 0, 0, 200), speedText);
+            // Main Text
+            draw_list->AddText(currentFont, speedFontPx, finalPos,
+                               IM_COL32(255, 255, 255, 255), speedText);
+        }
+
+        // 3. Draw Speed Unit (bottom-aligned with the speed value)
+        if (config.showUnit) {
+            float maxH = unitSize.y;
+            if (config.showSpeed && speedSize.y > maxH) maxH = speedSize.y;
+
+            float yOffset = maxH - unitSize.y;
+            ImVec2 finalPos = ImVec2(unitPos.x, unitPos.y + yOffset);
+
+            draw_list->AddText(currentFont, unitFontPx, finalPos,
+                               IM_COL32(180, 180, 180, 255), unitStr.c_str());
+        }
     }
 
     // Draw Config Window LAST so it appears on top
@@ -825,9 +862,16 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
 
     // Restore State
-    if (stateBlock) {
-        stateBlock->Apply();
-        stateBlock->Release();
+    if (g_stateBlock)
+        g_stateBlock->Apply();
+}
+
+void Drawing::OnDeviceLost() {
+    // The device is about to be reset: D3D9 requires all state blocks to be
+    // released beforehand. Render() re-creates it on the next frame.
+    if (g_stateBlock) {
+        g_stateBlock->Release();
+        g_stateBlock = nullptr;
     }
 }
 
@@ -840,5 +884,11 @@ bool Drawing::IsConfigOpen() {
 }
 
 bool Drawing::IsSteamVersion() {
-    return IN_GAME_UI_PTR == 0xD5A170;
+    // The addresses are compile-time selected via USE_STEAM_VERSION — this
+    // only reports which build we are.
+#ifdef USE_STEAM_VERSION
+    return true;
+#else
+    return false;
+#endif
 }

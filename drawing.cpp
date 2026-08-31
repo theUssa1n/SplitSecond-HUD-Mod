@@ -1,5 +1,4 @@
 #include "drawing.h"
-#include "imgui/imgui_internal.h"
 #include "embedded_fonts.h"
 #include "logger.h"
 #include <string>
@@ -365,9 +364,9 @@ void DrawConfigWindow() {
     ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
 
-    // Panel font: default 13px — glyphs are baked at the framebuffer density
-    // (see SetFontRasterizerDensity in Render), so text stays crisp at any
-    // internal resolution the game renders at.
+    // Panel font: default 13px at logical size. The draw data is scaled up to
+    // the render target in Render(), so at higher internal resolutions the
+    // text reads "thinner" rather than blurry.
     const bool fontPushed = (font_default != nullptr);
     if (fontPushed)
         ImGui::PushFont(font_default, 13.0f);
@@ -478,10 +477,11 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
     ImGuiIO& io = ImGui::GetIO();
 
     // The game may render into a surface LARGER than the window (DSR /
-    // internal supersampling). Tell ImGui the framebuffer scale: the DX9
-    // backend scales all geometry by it (1:1 surface pixels) and the 1.92
-    // font system bakes glyphs at that density, so text stays crisp.
-    // DisplaySize itself is left alone — it belongs to the backend.
+    // internal supersampling). We keep ImGui in window-client (logical) space
+    // and scale the ImDrawData geometry up to the render target ourselves
+    // right before RenderDrawData (the same approach other Split/Second
+    // overlay mods use). io.DisplayFramebufferScale stays (1,1) so fonts are
+    // baked at their logical size.
     float surfaceW = 0.0f, surfaceH = 0.0f;
 
     IDirect3DSurface9* rt = nullptr;
@@ -522,7 +522,6 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
         if (fbScaleY < 0.25f) fbScaleY = 0.25f;
         if (fbScaleY > 4.0f)  fbScaleY = 4.0f;
     }
-    io.DisplayFramebufferScale = ImVec2(fbScaleX, fbScaleY);
 
     static float lastFbScaleX = 0.0f;
     if (fbScaleX != lastFbScaleX) {
@@ -538,12 +537,6 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
     // ---------------------------------------------------------
 
     ImGui::NewFrame();
-
-    // Bake glyphs at the framebuffer density. Begin() would set this from
-    // DisplayFramebufferScale automatically, but our HUD text is drawn on the
-    // background draw list possibly BEFORE any window — set it explicitly so
-    // those glyphs are baked dense (crisp) too.
-    ImGui::SetFontRasterizerDensity(fbScaleX);
 
     // 1. Read Game Data
     float currentSpeed = 0.0f;
@@ -660,8 +653,15 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
     // exactly the number of ShowCursor(TRUE) calls we made when it closes.
     static int s_cursorShown = 0;
     if (shouldDrawConfig) {
-        ShowCursor(TRUE);
-        s_cursorShown++;
+        // The game may have hidden the cursor several times (deep negative
+        // display count) — boost until it is actually visible, counting EVERY
+        // ShowCursor(TRUE) we issue so closing undoes them exactly (otherwise
+        // the cursor is left visible after close).
+        int count;
+        do {
+            count = ShowCursor(TRUE);
+            s_cursorShown++;
+        } while (count < 0);
     } else if (s_cursorShown > 0) {
         for (int i = 0; i < s_cursorShown; i++)
             ShowCursor(FALSE);
@@ -859,7 +859,24 @@ void Drawing::Render(LPDIRECT3DDEVICE9 pDevice) {
 
     ImGui::EndFrame();
     ImGui::Render();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+
+    // Scale the draw data up to the render target (same technique as other
+    // Split/Second overlay mods): scale vertices, set DisplaySize to the
+    // surface size and scale the clip rects. Fonts stay baked at logical
+    // size, so on a 2x surface they read "thinner" rather than blurry.
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (drawData && (fbScaleX != 1.0f || fbScaleY != 1.0f)) {
+        for (auto& list : drawData->CmdLists) {
+            for (auto& vert : list->VtxBuffer) {
+                vert.pos.x *= fbScaleX;
+                vert.pos.y *= fbScaleY;
+            }
+        }
+        drawData->DisplaySize.x = surfaceW;
+        drawData->DisplaySize.y = surfaceH;
+        drawData->ScaleClipRects(ImVec2(fbScaleX, fbScaleY));
+    }
+    ImGui_ImplDX9_RenderDrawData(drawData);
 
     // Restore State
     if (g_stateBlock)

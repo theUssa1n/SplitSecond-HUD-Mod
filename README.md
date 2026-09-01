@@ -20,7 +20,7 @@ This mod requires **Ultimate ASI Loader** to function. You will find pre-built v
     - **Note**: If you are using other ASI mods, you might need to rename `dinput8.dll` to `version.dll` to avoid conflicts.
 2.  **Copy ASI Loader**: Place the included `dinput8.dll` (or `version.dll` if renamed) next to your game's executable (`SplitSecond.exe`).
 3.  **Download Mod**: Download the `speedometer.asi` file from the [releases page](https://github.com/theUssa1n/SplitSecond-HUD-Mod/releases) (or similar link) for your desired game version.
-4.  **Copy Mod File**: Copy the `splitsecond-speedometer.asi` file to your game's root directory (where `SplitSecond.exe` is located).
+4.  **Copy Mod File**: Copy the `speedometer.asi` file to your game's root directory (where `SplitSecond.exe` is located).
     - The fonts are embedded inside the `.asi` — no extra files are needed.
 5.  **Run the Game**: Launch `SplitSecond.exe`. The speedometer HUD should now be active in-game.
 
